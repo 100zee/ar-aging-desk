@@ -1,0 +1,156 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>엔진 테스트</title>
+<style>
+body{font-family:system-ui,'Malgun Gothic',sans-serif;margin:24px;background:#F3F5F4;color:#15201C;font-size:14px}
+h1{font-size:20px}.ok{color:#1B6533}.ng{color:#A92B2B;font-weight:600}
+li{margin:2px 0;font-family:ui-monospace,Menlo,monospace;font-size:12.5px}
+#sum{font-weight:600;font-size:16px}
+</style>
+</head>
+<body>
+<h1>채권연령 분석기 · 엔진 테스트</h1>
+<p id="sum">실행 중…</p>
+<ul id="out"></ul>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
+<script src="js/engine.js"></script>
+<script src="js/parser.js"></script>
+<script src="js/sample.js"></script>
+<script src="js/report.js"></script>
+<script>
+const results = [];
+function test(name, fn) { try { fn(); results.push([true, name]); } catch (e) { results.push([false, name + ' → ' + e.message]); console.error(name, e); } }
+function eq(a, b, msg) { if (a !== b) throw new Error(`${msg || ''} 기대 ${JSON.stringify(b)}, 실제 ${JSON.stringify(a)}`); }
+function ok(c, msg) { if (!c) throw new Error(msg || '조건 불만족'); }
+
+/* ---- 날짜 ---- */
+test('toDn: 문자열·점·8자리·엑셀 일련번호', () => {
+  const d = dn(2026, 5, 30);
+  eq(toDn('2026-06-30'), d); eq(toDn('2026.06.30'), d); eq(toDn('20260630'), d); eq(toDn(46203), d); eq(toDn(''), null);
+});
+test('eomonth / addMonths(말일 보정)', () => {
+  eq(ymd(eomonth(dn(2026, 1, 10))), '2026-02-28');
+  eq(ymd(addMonths(dn(2026, 4, 31), -3)), '2026-02-28');
+  eq(ymd(addMonths(dn(2026, 5, 30), -12)), '2025-06-30');
+});
+
+/* ---- 작은 시나리오 ---- */
+function mini(rows, extra) {
+  const base = dn(2026, 5, 30);
+  const W = {
+    raw: rows.map(r => Object.assign({ acct: '11141110', acctName: '', text: '', cust: 'C1', custName: '갑', payTM: 'D030', payT: 'D030', docDate: base - 10, local: 1000, docAmt: 1000, cur: 'KRW', dueDate: null, clearDate: null }, r)),
+    master: [{ code: 'C1', name: '갑', region: '내수', grade: '정상', limit: 0 }, { code: 'C2', name: '을', region: '내수', grade: '부실', limit: 0 }],
+    config: { baseDate: base, accounts: SAMPLE_ACCOUNTS.map(a => ({ code: a[0], name: a[1], big: a[2], sub: a[3] })), payTerms: [{ code: 'D030', base: '월말', days: 30 }, { code: 'E060', base: '증빙일', days: 60 }], fx: { USD: 1400 }, bucketRates: [0.01, 0.02, 0.05, 0.2, 0.5], gradeRates: { 부실: 0.5, 대손: 1 }, sales: {}, salesDays: 91 },
+    tb: [], prior: null
+  };
+  Object.assign(W, extra || {});
+  return analyze(W);
+}
+test('구간 경계: 29→0, 30→1, 59→1, 60→2, 119→3, 120→4', () => {
+  const base = dn(2026, 5, 30);
+  const A = mini([29, 30, 59, 60, 119, 120].map(a => ({ docDate: base - a })));
+  eq(A.rows.map(r => r.bucket).join(), '0,1,1,2,3,4');
+});
+test('반제일 ≤ 기준일 제외, 반제일 > 기준일 포함, 증빙일 > 기준일 제외', () => {
+  const base = dn(2026, 5, 30);
+  const A = mini([{ clearDate: base }, { clearDate: base + 1 }, { docDate: base + 1 }]);
+  eq(A.rows.map(r => r.incl).join(), 'false,true,false');
+  eq(A.rows[2].exReason, '기준일 이후 발생');
+});
+test('만기일: SAP 값 우선, 없으면 PayT(월말+30), PayT 비면 마스터 조건', () => {
+  const base = dn(2026, 5, 30);
+  const A = mini([{ docDate: dn(2026, 4, 10), dueDate: dn(2026, 6, 1) }, { docDate: dn(2026, 4, 10) }, { docDate: dn(2026, 4, 10), payT: '' }]);
+  eq(ymd(A.rows[0].due), '2026-07-01'); eq(A.rows[0].dueSrc, 'SAP');
+  eq(ymd(A.rows[1].due), '2026-06-30'); eq(A.rows[1].dueSrc, 'PayT 산정');
+  eq(ymd(A.rows[2].due), '2026-06-30'); eq(A.findings.payFilled.length, 1);
+});
+test('공시용: 기준일 당일 만기 = 만기미도래, 3개월 경계는 달력 월', () => {
+  const base = dn(2026, 5, 30);
+  const A = mini([{ dueDate: base }, { dueDate: dn(2026, 2, 30) }, { dueDate: dn(2026, 2, 29) }, { dueDate: null, payT: 'XX', payTM: '' }]);
+  eq(A.rows.map(r => r.disc).join(), '0,1,2,5');
+});
+test('외화: 화폐성은 기말환율 환산, 선수금은 그대로', () => {
+  const A = mini([{ cur: 'USD', docAmt: 10, local: 13000 }, { acct: '21151110', cur: 'USD', docAmt: -10, local: -13000, cust: '' }]);
+  eq(A.rows[0].amt, 14000); eq(A.rows[1].amt, -13000);
+});
+test('재분류: 미수금 + "제품매출" → 국판, 대사는 원계정', () => {
+  const A = mini([{ acct: '11145110', text: '제품매출 6월', local: 500, docAmt: 500 }], { tb: [{ code: '11145110', amount: 500 }] });
+  eq(A.rows[0].finalAcct, '11141110'); eq(A.rows[0].sub, '외상매출금 내수');
+  eq(A.recon.find(r => r.code === '11145110').diff, 0);
+  eq(A.bySub['외상매출금 내수'].total, 500);
+});
+test('충당금: 구간률, 부실 50% 우선, 음수·거래선 없음은 0', () => {
+  const base = dn(2026, 5, 30);
+  const A = mini([{ docDate: base - 130, local: 1000 }, { cust: 'C2', local: 1000 }, { local: -1000 }, { cust: '', local: 1000 }]);
+  eq(A.rows.map(r => r.prov).join(), '500,500,0,0');
+});
+test('여신한도 초과: 잔액 > 한도', () => {
+  const W = { master: [{ code: 'C1', name: '갑', region: '내수', grade: '정상', limit: 1500 }] };
+  const A = mini([{ local: 1000 }, { local: 1000 }], W);
+  eq(A.credit.length, 1); eq(A.credit[0].over, 500);
+});
+test('등급 제안: 정상인데 120일 이상 60% → 부실', () => {
+  const base = dn(2026, 5, 30);
+  const A = mini([{ docDate: base - 200, local: 600 }, { local: 400 }]);
+  eq(A.gradeIssues[0].sug, '부실'); eq(A.gradeIssues[0].dir, '상향');
+});
+
+/* ---- 샘플 전체 ---- */
+let sheets, P, A;
+test('샘플 생성·파싱', () => { sheets = buildSample(); P = parseBook(sheets); A = analyze(P.W); ok(P.W.raw.length > 4000, '행 수 ' + P.W.raw.length); eq(P.notices.length, 0, '알림 ' + P.notices.join('/')); });
+test('샘플 계정대사: 10개 계정 모두 시산표와 차이 0', () => {
+  eq(A.recon.length, 10);
+  A.recon.forEach(r => eq(Math.round(r.diff), 0, r.code));
+});
+test('샘플: 데이터 점검 항목이 모두 나타남', () => {
+  const F = A.findings;
+  ok(F.clearedBefore.length > 0, '반제'); ok(F.reclass.length === 5, '재분류 ' + F.reclass.length); ok(F.dueFilled.length > 0, '만기'); ok(F.payFilled.length > 0, 'PayT');
+  ok(F.unregistered.size === 2, '미등록'); ok(F.nameDiff.size > 0, '이름'); ok(F.negative.length > 0, '음수'); ok(F.noCust.length > 0, '거래선 없음');
+});
+test('샘플: 리스크 신호(120일+, 여신 초과, 등급 의견, 전분기 비교)', () => {
+  ok(A.ar120 > 0); ok(A.credit.length >= 3, '여신 ' + A.credit.length); ok(A.gradeIssues.length >= 3, '등급 ' + A.gradeIssues.length);
+  ok(A.hasPrior); const st = new Set(A.risk120.map(r => r.status)); ['신규', '증가', '감소', '해소'].forEach(s => ok(st.has(s), s));
+  ok(A.dso.all > 40 && A.dso.all < 90, 'DSO ' + A.dso.all);
+});
+test('샘플: 소분류 합계 = 거래선 피벗 합계 = 공시용 합계', () => {
+  for (const s of SUBS) {
+    const b = A.bySub[s];
+    eq(Math.round(sumArr(A.pivots[s].map(c => c.total))), Math.round(b.total), s + ' 피벗');
+    eq(Math.round(sumArr(b.disc)), Math.round(b.total), s + ' 공시');
+    eq(Math.round(sumArr(b.buckets)), Math.round(b.total), s + ' 구간');
+  }
+});
+test('기준일 변경 시 재계산(3/31): 이후 증빙은 제외, 구간 이동', () => {
+  const A2 = analyze(P.W, dn(2026, 2, 31));
+  ok(A2.findings.futureDoc.length > 0); ok(A2.arTotal !== A.arTotal);
+  ok(A2.rows.every(r => !r.incl || r.docDate <= A2.base));
+});
+test('엑셀 왕복: 샘플 → xlsx → 다시 읽기 → 같은 결과', () => {
+  if (typeof XLSX === 'undefined') throw new Error('SheetJS 로드 실패');
+  const wb = XLSX.utils.book_new();
+  for (const [n, aoa] of Object.entries(sheets)) XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet(aoa), n);
+  const buf = XLSX.write(wb, { type: 'array', bookType: 'xlsx' });
+  const P2 = parseBook(workbookToSheets(XLSX.read(buf, { type: 'array' })));
+  const A2 = analyze(P2.W);
+  eq(A2.arTotal, A.arTotal); eq(A2.provAR, A.provAR); eq(A2.recon.map(r => Math.round(r.diff)).join(), A.recon.map(r => Math.round(r.diff)).join());
+});
+test('기준정보·시산표·전분기 없이도 동작(기본값 + 알림)', () => {
+  const P3 = parseBook({ RAW_채권원장: sheets.RAW_채권원장, 거래선마스터: sheets.거래선마스터 });
+  const A3 = analyze(P3.W);
+  ok(P3.notices.length >= 3, '알림 ' + P3.notices.length); eq(ymd(P3.W.config.baseDate), '2026-06-30'); ok(A3.arTotal > 0);
+});
+test('필수 시트 없으면 알기 쉬운 오류', () => {
+  let msg = ''; try { parseBook({ 시트1: [[1]] }); } catch (e) { msg = e.message; }
+  ok(/RAW_채권원장/.test(msg), msg);
+});
+
+const fails = results.filter(r => !r[0]).length;
+document.getElementById('sum').innerHTML = fails ? `<span class="ng">${fails}개 실패</span> / ${results.length}개` : `<span class="ok">${results.length}개 모두 통과</span>`;
+document.getElementById('out').innerHTML = results.map(r => `<li class="${r[0] ? 'ok' : 'ng'}">${r[0] ? '✓' : '✗'} ${r[1].replace(/</g, '&lt;')}</li>`).join('');
+window.__testResult = { total: results.length, fails, results };
+</script>
+</body>
+</html>
